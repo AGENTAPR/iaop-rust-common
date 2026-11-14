@@ -5,8 +5,8 @@
 //! JWKS fetching/rotation is the caller's responsibility (port trait
 //! [`JwksProvider`]); this crate stays transport-free.
 
-pub mod jwks;
 pub mod axum;
+pub mod jwks;
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
