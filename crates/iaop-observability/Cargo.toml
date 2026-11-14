@@ -1,0 +1,12 @@
+[package]
+name = "iaop-observability"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "IAOP shared technical library: iaop-observability"
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true

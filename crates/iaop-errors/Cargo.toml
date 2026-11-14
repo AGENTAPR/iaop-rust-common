@@ -1,0 +1,12 @@
+[package]
+name = "iaop-errors"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "IAOP shared technical library: iaop-errors"
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true

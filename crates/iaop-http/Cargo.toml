@@ -1,0 +1,12 @@
+[package]
+name = "iaop-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "IAOP shared technical library: iaop-http"
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
