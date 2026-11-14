@@ -1,13 +1,16 @@
 //! Axum integration: bearer extraction, auth middleware, principal.
 //! 401 = unauthenticated; 403 = authenticated but unauthorized.
 
-use crate::{Claims, JwtError, jwks::{JwksProvider, JwtValidator}};
+use crate::{
+    Claims, JwtError,
+    jwks::{JwksProvider, JwtValidator},
+};
 use axum::{
+    Json,
     extract::FromRequestParts,
-    http::{request::Parts, StatusCode},
+    http::{StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 use std::sync::Arc;
