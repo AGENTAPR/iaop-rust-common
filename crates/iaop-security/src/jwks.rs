@@ -66,9 +66,15 @@ impl JwksProvider for RemoteJwksProvider {
 pub struct JwksCache<P: JwksProvider> {
     provider: Arc<P>,
     ttl: Duration,
+    /// Keys older than `ttl` but younger than `stale_ttl` may still verify
+    /// when the upstream JWKS fetch fails (bounded stale-key policy).
+    stale_ttl: Duration,
     negative_ttl: Duration,
     min_refresh_interval: Duration,
     state: Mutex<CacheState>,
+    /// Singleflight: only one task refreshes JWKS at a time; concurrent
+    /// misses wait, then re-check the cache (double-checked locking).
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 struct CacheState {
@@ -82,6 +88,7 @@ impl<P: JwksProvider> JwksCache<P> {
         Self {
             provider: Arc::new(provider),
             ttl,
+            stale_ttl: ttl.saturating_mul(3),
             negative_ttl: Duration::from_secs(30),
             min_refresh_interval: Duration::from_secs(10),
             state: Mutex::new(CacheState {
@@ -89,6 +96,7 @@ impl<P: JwksProvider> JwksCache<P> {
                 fetched_at: None,
                 negative_cache: HashMap::new(),
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -118,31 +126,58 @@ impl<P: JwksProvider> JwksCache<P> {
                 return Err(JwtError::UnknownKey);
             }
         }
-
-        // 4. Refresh keys from upstream provider (release lock during I/O)
         drop(st);
-        let doc = self.provider.jwks().await?;
 
-        let mut st = self.state.lock().await;
-        st.keys.clear();
-        for jwk in doc.keys {
-            if let Some(k) = jwk.kid.clone() {
-                st.keys.insert(k, (jwk, Instant::now()));
+        // 4. Singleflight refresh: concurrent misses serialize here; the
+        //    winner fetches, losers re-check the cache afterwards.
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        // Double-check: another task may have refreshed while we waited.
+        {
+            let st = self.state.lock().await;
+            if let Some((jwk, at)) = st.keys.get(kid) {
+                if at.elapsed() < self.ttl {
+                    return jwk_to_key(jwk);
+                }
             }
         }
-        st.fetched_at = Some(Instant::now());
 
-        // Bounded negative cache cleanup
-        if st.negative_cache.len() > 500 {
-            st.negative_cache
-                .retain(|_, at| at.elapsed() < self.negative_ttl);
-        }
+        match self.provider.jwks().await {
+            Ok(doc) => {
+                let mut st = self.state.lock().await;
+                st.keys.clear();
+                for jwk in doc.keys {
+                    if let Some(k) = jwk.kid.clone() {
+                        st.keys.insert(k, (jwk, Instant::now()));
+                    }
+                }
+                st.fetched_at = Some(Instant::now());
 
-        match st.keys.get(kid) {
-            Some((jwk, _)) => jwk_to_key(jwk),
-            None => {
-                st.negative_cache.insert(kid.to_string(), Instant::now());
-                Err(JwtError::UnknownKey)
+                // Bounded negative cache cleanup
+                if st.negative_cache.len() > 500 {
+                    st.negative_cache
+                        .retain(|_, at| at.elapsed() < self.negative_ttl);
+                }
+
+                match st.keys.get(kid) {
+                    Some((jwk, _)) => jwk_to_key(jwk),
+                    None => {
+                        st.negative_cache.insert(kid.to_string(), Instant::now());
+                        Err(JwtError::UnknownKey)
+                    }
+                }
+            }
+            Err(e) => {
+                // Stale-key policy: if the provider is down but we hold a
+                // recently-expired key within the stale window, keep serving
+                // it rather than failing every request.
+                let st = self.state.lock().await;
+                if let Some((jwk, at)) = st.keys.get(kid) {
+                    if at.elapsed() < self.stale_ttl {
+                        return jwk_to_key(jwk);
+                    }
+                }
+                Err(e)
             }
         }
     }
@@ -276,5 +311,37 @@ mod tests {
         let res3 = cache.decoding_key("unknown-1").await;
         assert!(matches!(res3, Err(JwtError::UnknownKey)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kids_trigger_single_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct SlowProvider(Arc<AtomicUsize>);
+        impl JwksProvider for SlowProvider {
+            async fn jwks(&self) -> Result<JwksDocument, JwtError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(JwksDocument { keys: vec![] })
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cache = std::sync::Arc::new(JwksCache::new(
+            SlowProvider(counter.clone()),
+            Duration::from_secs(300),
+        ));
+
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let c = cache.clone();
+            handles.push(tokio::spawn(async move {
+                c.decoding_key(&format!("kid-{i}")).await
+            }));
+        }
+        for h in handles {
+            assert!(matches!(h.await.unwrap(), Err(JwtError::UnknownKey)));
+        }
+        // Singleflight + rate limiting: far fewer upstream fetches than callers.
+        assert!(counter.load(Ordering::SeqCst) <= 2);
     }
 }
