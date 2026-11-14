@@ -134,10 +134,21 @@ impl<P: JwksProvider> JwksCache<P> {
 
         // Double-check: another task may have refreshed while we waited.
         {
-            let st = self.state.lock().await;
+            let mut st = self.state.lock().await;
             if let Some((jwk, at)) = st.keys.get(kid) {
                 if at.elapsed() < self.ttl {
                     return jwk_to_key(jwk);
+                }
+            }
+            if let Some(neg_at) = st.negative_cache.get(kid) {
+                if neg_at.elapsed() < self.negative_ttl {
+                    return Err(JwtError::UnknownKey);
+                }
+            }
+            if let Some(last_fetch) = st.fetched_at {
+                if last_fetch.elapsed() < self.min_refresh_interval {
+                    st.negative_cache.insert(kid.to_string(), Instant::now());
+                    return Err(JwtError::UnknownKey);
                 }
             }
         }
