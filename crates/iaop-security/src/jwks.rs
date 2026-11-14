@@ -62,16 +62,19 @@ impl JwksProvider for RemoteJwksProvider {
     }
 }
 
-/// JWKS cache keyed by `kid`; refreshes on miss/expiry.
+/// JWKS cache keyed by `kid`; refreshes on miss/expiry with rate-limiting and negative caching.
 pub struct JwksCache<P: JwksProvider> {
     provider: Arc<P>,
     ttl: Duration,
+    negative_ttl: Duration,
+    min_refresh_interval: Duration,
     state: Mutex<CacheState>,
 }
 
 struct CacheState {
     keys: HashMap<String, (Jwk, Instant)>,
     fetched_at: Option<Instant>,
+    negative_cache: HashMap<String, Instant>,
 }
 
 impl<P: JwksProvider> JwksCache<P> {
@@ -79,49 +82,69 @@ impl<P: JwksProvider> JwksCache<P> {
         Self {
             provider: Arc::new(provider),
             ttl,
+            negative_ttl: Duration::from_secs(30),
+            min_refresh_interval: Duration::from_secs(10),
             state: Mutex::new(CacheState {
                 keys: HashMap::new(),
                 fetched_at: None,
+                negative_cache: HashMap::new(),
             }),
         }
     }
 
-    /// Returns a decoding key for `kid`, refreshing the JWKS document on miss/stale.
+    /// Returns a decoding key for `kid`, refreshing the JWKS document on miss/stale
+    /// with negative caching and refresh rate-limiting to prevent JWKS storms.
     pub async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, JwtError> {
-        {
-            let st = self.state.lock().await;
-            if let Some((jwk, at)) = st.keys.get(kid) {
-                if at.elapsed() < self.ttl {
-                    return jwk_to_key(jwk);
-                }
-            }
-            let stale = st
-                .fetched_at
-                .map(|t| t.elapsed() >= self.ttl)
-                .unwrap_or(true);
-            if !stale {
-                // fresh doc but unknown kid — try once more below anyway
-            }
-        }
-        self.refresh().await?;
-        let st = self.state.lock().await;
-        match st.keys.get(kid) {
-            Some((jwk, _)) => jwk_to_key(jwk),
-            None => Err(JwtError::UnknownKey),
-        }
-    }
+        let mut st = self.state.lock().await;
 
-    async fn refresh(&self) -> Result<(), JwtError> {
+        // 1. Check positive cache
+        if let Some((jwk, at)) = st.keys.get(kid) {
+            if at.elapsed() < self.ttl {
+                return jwk_to_key(jwk);
+            }
+        }
+
+        // 2. Check negative cache (known invalid kid within cooldown)
+        if let Some(at) = st.negative_cache.get(kid) {
+            if at.elapsed() < self.negative_ttl {
+                return Err(JwtError::UnknownKey);
+            }
+        }
+
+        // 3. Rate-limit refresh: if JWKS was fetched recently, don't spam upstream
+        if let Some(last_fetch) = st.fetched_at {
+            if last_fetch.elapsed() < self.min_refresh_interval {
+                st.negative_cache.insert(kid.to_string(), Instant::now());
+                return Err(JwtError::UnknownKey);
+            }
+        }
+
+        // 4. Refresh keys from upstream provider (release lock during I/O)
+        drop(st);
         let doc = self.provider.jwks().await?;
+
         let mut st = self.state.lock().await;
         st.keys.clear();
         for jwk in doc.keys {
-            if let Some(kid) = jwk.kid.clone() {
-                st.keys.insert(kid, (jwk, Instant::now()));
+            if let Some(k) = jwk.kid.clone() {
+                st.keys.insert(k, (jwk, Instant::now()));
             }
         }
         st.fetched_at = Some(Instant::now());
-        Ok(())
+
+        // Bounded negative cache cleanup
+        if st.negative_cache.len() > 500 {
+            st.negative_cache
+                .retain(|_, at| at.elapsed() < self.negative_ttl);
+        }
+
+        match st.keys.get(kid) {
+            Some((jwk, _)) => jwk_to_key(jwk),
+            None => {
+                st.negative_cache.insert(kid.to_string(), Instant::now());
+                Err(JwtError::UnknownKey)
+            }
+        }
     }
 }
 
@@ -223,5 +246,35 @@ mod tests {
             e: None,
         };
         assert!(jwk_to_key(&jwk).is_err());
+    }
+
+    #[tokio::test]
+    async fn rate_limits_unknown_kid_and_negative_caches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingProvider(Arc<AtomicUsize>);
+        impl JwksProvider for CountingProvider {
+            async fn jwks(&self) -> Result<JwksDocument, JwtError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(JwksDocument { keys: vec![] })
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cache = JwksCache::new(CountingProvider(counter.clone()), Duration::from_secs(300));
+
+        // First call fetches from upstream
+        let res1 = cache.decoding_key("unknown-1").await;
+        assert!(matches!(res1, Err(JwtError::UnknownKey)));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Immediate second call with different unknown kid hits min_refresh_interval and does NOT call upstream
+        let res2 = cache.decoding_key("unknown-2").await;
+        assert!(matches!(res2, Err(JwtError::UnknownKey)));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Third call with first unknown kid hits negative cache directly
+        let res3 = cache.decoding_key("unknown-1").await;
+        assert!(matches!(res3, Err(JwtError::UnknownKey)));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }
